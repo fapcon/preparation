@@ -1,0 +1,247 @@
+
+*////////////////////////////////////////////////////////////////////////////////////*
+МАПЫ
+*////////////////////////////////////////////////////////////////////////////////////*
+
+для того чтобы создавать мапу с любыми типами ключей и значений под капотом не используют пустые интерфейсы или дженерики, а используют тайп дескрипторы (Type Descriptors)
+
+Тайп Дескриптор под капотом:
+type Type struct {
+	Size_       uintptr
+	PtrBytes    uintptr // number of (prefix) bytes in the type that can contain pointers
+	Hash        uint32  // hash of type; avoids computation in hash tables
+	TFlag       TFlag   // extra type information flags
+	Align_      uint8   // alignment of variable with this type
+	FieldAlign_ uint8   // alignment of struct field with this type
+	Kind_       uint8   // enumeration for C
+	// function for comparing objects of this type
+	// (ptr to object A, ptr to object B) -> ==?
+	Equal func(unsafe.Pointer, unsafe.Pointer) bool
+	// GCData stores the GC type data for the garbage collector.
+	// If the KindGCProg bit is set in kind, GCData is a GC program.
+	// Otherwise it is a ptrmask bitmap. See mbitmap.go for details.
+	GCData    *byte
+	Str       NameOff // string form
+	PtrToThis TypeOff // type for pointer to this type, may be zero
+}
+
+С помощью Тайп Дескрипторов (type Type struct) получается тип мапы:
+
+type MapType struct {
+	Type
+	Key    *Type
+	Elem   *Type
+	Bucket *Type // internal type representing a hash bucket
+	// function for hashing keys (ptr to key, seed) -> hash
+	Hasher     func(unsafe.Pointer, uintptr) uintptr
+	KeySize    uint8  // size of key slot
+	ValueSize  uint8  // size of elem slot
+	BucketSize uint16 // size of bucket
+	Flags      uint32
+}
+
+
+
+v = m[k], что будет происходить при компиляции?:
+
+внутри мапы работаем только с unsafe.Pointer, поэтому сначала конвертируем указатель на ключ в unsafe.Pointer:
+
+pk := unsafe.Pointer(&k)
+                                     pk
+                                     ==
+func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer //функция поиска значения по ключу
+
+v, ok := m[k]
+func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) //функция поиска+подтверждения что там что то хранилось
+
+m[k] = v
+func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer //функция установки значения по ключу
+
+mapdelete(m, k)
+func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) //функция удаления значения по ключу
+
+
+общая структура мапы:
+
+type hiter struct {
+	key         unsafe.Pointer // Must be in first position.  Write nil to indicate iteration end (see cmd/compile/internal/walk/range.go).
+	elem        unsafe.Pointer // Must be in second position (see cmd/compile/internal/walk/range.go).
+	t           *maptype
+	h           *hmap
+	buckets     unsafe.Pointer // bucket ptr at hash_iter initialization time
+	bptr        *bmap          // current bucket
+	overflow    *[]*bmap       // keeps overflow buckets of hmap.buckets alive
+	oldoverflow *[]*bmap       // keeps overflow buckets of hmap.oldbuckets alive
+	startBucket uintptr        // bucket iteration started at
+	offset      uint8          // intra-bucket offset to start from during iteration (should be big enough to hold bucketCnt-1)
+	wrapped     bool           // already wrapped around from end of bucket array to beginning
+	B           uint8
+	i           uint8
+	bucket      uintptr
+	checkBucket uintptr
+}
+
+// A header for a Go map.
+type hmap struct {
+	// Note: the format of the hmap is also encoded in cmd/compile/internal/reflectdata/reflect.go.
+	// Make sure this stays in sync with the compiler's definition.
+	count     int // # live cells == size of map.  Must be first (used by len() builtin)
+	flags     uint8
+	B         uint8  // log_2 of # of buckets (can hold up to loadFactor * 2^B items)
+	noverflow uint16 // approximate number of overflow buckets; see incrnoverflow for details
+	hash0     uint32 // hash seed
+
+	buckets    unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
+	oldbuckets unsafe.Pointer // previous bucket array of half the size, non-nil only when growing
+	nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
+
+	extra *mapextra // optional fields
+}
+
+// A bucket for a Go map.
+type bmap struct {
+	// tophash generally contains the top byte of the hash value
+	// for each key in this bucket. If tophash[0] < minTopHash,
+	// tophash[0] is a bucket evacuation state instead.
+	tophash [bucketCnt]uint8
+	// Followed by bucketCnt keys and then bucketCnt elems.
+	// NOTE: packing all the keys together and then all the elems together makes the
+	// code a bit more complicated than alternating key/elem/key/elem/... but it allows
+	// us to eliminate padding which would be needed for, e.g., map[int64]int8.
+	// Followed by an overflow pointer.
+}
+
+Эвакуация данных когда loadFactor == 6.5
+
+// Picking loadFactor: too large and we have lots of overflow
+// buckets, too small and we waste a lot of space. I wrote
+// a simple program to check some stats for different loads:
+// (64-bit, 8 byte keys and elems)
+//  loadFactor    %overflow  bytes/entry     hitprobe    missprobe
+//        4.00         2.13        20.77         3.00         4.00
+//        4.50         4.05        17.30         3.25         4.50
+//        5.00         6.85        14.77         3.50         5.00
+//        5.50        10.55        12.94         3.75         5.50
+//        6.00        15.27        11.67         4.00         6.00
+//        6.50        20.90        10.79         4.25         6.50
+//        7.00        27.14        10.15         4.50         7.00
+//        7.50        34.03         9.73         4.75         7.50
+//        8.00        41.10         9.40         5.00         8.00
+//
+// %overflow   = percentage of buckets which have an overflow bucket
+// bytes/entry = overhead bytes used per key/elem pair
+// hitprobe    = # of entries to check when looking up a present key
+// missprobe   = # of entries to check when looking up an absent key
+
+Эвакуация == аллокация памяти для в 2 раза большего списка бакетов, но не его инициализация, затем постепенное копирование данных из старой мапы (в
+момент выполнения операций вставки или удаления). В ходе этого процесса данные распределяются по новым бакетам.
+
+Во время эвакуации данных доступ к значениям в мапе будет в среднем в 2 раза медленнее, тк искать нужно будет по 2 мапам сразу (старой и новой)
+
+Чтобы изюежать замедления поиска из-за эвакуации при возможности необходимо заранее аллоцировать конкретное колличество памяти
+(если знаем, сколько элементов в мапе нам нужно хранить)
+m := make(map[string]int, 1000)
+
+
+*////////////////////////////////////////////////////////////////////////////////////*
+КАНАЛЫ
+*////////////////////////////////////////////////////////////////////////////////////*
+
+свойства каналов:
+-потокобезопасность (с одним каналом могут работать сразу несколько горутин, не нужно использовать примитивы синхронизации) //hchan mutex
+-могут хранить в себе элементы (если буферизированные) и реализуют семантику FIFO //hchan buf
+-передача данных между горутинами /sendDirect(), operations with buf
+-блокировка горутин //sendq, recvq, sudog,   calls to scheduler: gopark(), goready()
+
+type hchan struct {
+	qcount   uint           // total data in the queue
+	dataqsiz uint           // size of the circular queue
+	buf      unsafe.Pointer // points to an array of dataqsiz elements
+	elemsize uint16
+	closed   uint32
+	elemtype *_type // element type
+	sendx    uint   // send index (индекс элемента буфера канала по которому будут сложены следующие данные)
+	recvx    uint   // receive index (индекс элемента буфера канала из которого будут считаны  следующие данные)
+	recvq    waitq  // list of recv waiters
+	sendq    waitq  // list of send waiters
+
+	// lock protects all fields in hchan, as well as several
+	// fields in sudogs blocked on this channel.
+	//
+	// Do not change another G's status while holding this lock
+	// (in particular, do not ready a G), as this can deadlock
+	// with stack shrinking.
+	lock mutex
+}
+
+буфер - кольцевая очередь
+
+sender складывает данные в канал:
+1. блокировка мютекса
+2. данные из сендера КОПИРУЮТСЯ в буфер(очередь) канала (те у сендера и у ресивира будут 2 разные копии данных, не зависящие друг от друга)
+   (если мы не передаем ссылочный тип)
+3. разблокировка мютекса
+
+reviever получает данные из канала:
+1. блокировка мютекса
+2. данные из очереди(буфера) КОПИРУЮТСЯ ресиверу
+3. разблокировка мютекса
+
+что происходит, если канал в который хотим записать - переполнен?
+1. функция, отвечающая за отправку данных в канал вызовет функцию gopark()
+2. gopark() напрямую обращается к планировщику, который изменяет состояние горутины(которая хочет записать в заполненный канал)
+   из running в waiting
+3. планировщик разрывает связь этой горутины с OS thread'ом, из-за чего поток ОС становится свободным
+4. если в runqueue есть другая горутина, то планировщик отдает ОС тред ей, таким образом поток ОС не простаивает
+
+как затем пробуждается горутина, которая была остановлена из-за переполненного буфера?
+1. эта горутина попадает в очередь sendq
+   sendq    waitq  // list of send waiters
+
+   type waitq struct {
+   	first *sudog //указатель на начало связного списка ждущих горутин
+   	last  *sudog //указатель на конец связного списка ждущих горутин
+   }
+
+   type sudog struct {
+    g *g  //спящая горутина
+    elem unsafe.Pointer //элемент который мы хотим отправить (если горутина ждет приема данных, то здесь ссылка на ячейку памяти,  в которую надо
+                          положить данные)
+   }
+2. ресивер данных вызывает функцию goready(), которая меняет состояние спящей горутины с waiting на runnable(готов к запуску)
+3. после set runnable горутина попадает в очередь runq
+
+если спит reciever (указатель на sudog в recvq) и приходит sender, вызывается функция sendDirect(), которая кладет данные из стека одной горутины(сендера) в стек другой(ресивера)
+таким образом оптимизируется работа каналов(не происходит копирования с сендера в буфер и из буфера в ресивер)
+
+такая же ситуация с небуферезированными каналами, используется функция sendDirect()
+
+при чтении из закрытого канала получаем нулевое значение типа канала
+
+close сначала проверяет инициализирован ли канал
+если канат не инициализирован, то паника close on nil channel
+
+Closing
+-Is channels initialised? Panic if not
+-lock the mutex
+-is channel closed? Panic if yes
+-set ch.closed = true
+-release all readers
+-release all writers - they will panic
+-unlock the mutex
+- unlock all goroutines
+
+*////////////////////////////////////////////////////////////////////////////////////*
+SELECT
+*////////////////////////////////////////////////////////////////////////////////////*
+
+порядок обхода кейсов случайный
+
+type scase struct {
+	c    *hchan         // chan
+	elem unsafe.Pointer // data element
+}
+
+*////////////////////////////////////////////////////////////////////////////////////*
+ИНТЕРФЕЙСЫ
+*////////////////////////////////////////////////////////////////////////////////////*
